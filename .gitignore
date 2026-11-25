@@ -1,5 +1,6 @@
 node_modules/
 .DS_Store
 .env
+*.log
 # GitHub 공개(Public) 저장소에 올릴 경우 아래 주석 해제
 # .clasp.json
