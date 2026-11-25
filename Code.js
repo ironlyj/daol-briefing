@@ -30,6 +30,8 @@
  *  - 활동 사진: 메일로 보낸 유치원 활동 사진에서 활동 한 줄 메모를 뽑아 ACTIVITY_LOG에 보관(14일), 최근 3일을 격려 문장·브리핑 메일에 참고
  *  - 격려 문장: 아침용(cheers)·오후용(cheers_pm) 분리, 구글 문서 '다올 격려 문장 지침'의 지침과 날짜별 '꼭 말할 것'(cheer_must) 반영
  *  - 토큰 사용량 기록(USAGE_LOG) + 매주 월 08시 사용량·추정비용 메일(CSV 첨부, 브리핑과 별도) — installTrigger 재실행 필요
+ *  - 격려 문장 기록을 구글 문서 로그 → 시트 '다올 격려 문장 평가'로 변경. 문장마다 좋음·나쁨 체크박스+메모,
+ *    체크한 문장(최근 400행에서 각 8개)을 다음 생성 프롬프트에 '이런 느낌으로/이런 건 피하기'로 넣음 (CHEER_SHEET_ID)
  */
 
 const KINDERGARTEN        = '아랑유치원';
@@ -712,7 +714,7 @@ function generateAndDispatchBriefing_(cfg, calSnapshot, options) {
   const todayBrief = buildDayBriefing_(todayStr, '오늘', docText, todayCalEvents, cfg.apiKey, cfg.briefingModel);
   const tomorrowBrief = buildDayBriefing_(tomorrowStr, '내일', docText, tomorrowCalEvents, cfg.apiKey, cfg.briefingModel);
 
-  // 격려 문장 기록 (추후 개선용): 구글 문서 '다올 격려 문장 로그'에 생성분을 남김. 실패해도 브리핑엔 영향 없음
+  // 격려 문장 기록: 시트 '다올 격려 문장 평가'에 문장별로 남김(좋음·나쁨 체크 → 다음 생성에 반영). 실패해도 브리핑엔 영향 없음
   logCheers_(cfg.props, todayBrief, generatedAt, cfg.briefingModel);
   delete todayBrief.cheer_context;
   delete tomorrowBrief.cheer_context;
@@ -791,6 +793,8 @@ function buildDayBriefing_(targetDateStr, dayLabel, docText, calEventsForDay, ap
   const recentActs = wantCheers ? recentActivityLines_(targetDateStr, ACTIVITY_CHEER_DAYS) : [];
   // 보호자가 구글 문서 '다올 격려 문장 지침'에 적은 지침과 그날 꼭 말할 것
   const guideDoc = wantCheers ? getCheerGuide_(targetDateStr) : { guide: '', must: [] };
+  // 보호자가 시트 '다올 격려 문장 평가'에서 체크한 좋음·나쁨 문장
+  const feedback = wantCheers ? getCheerFeedback_() : { good: [], bad: [] };
   const cheerSpecLines = [
     'cheers: 아침·등원 전에 들을 문장 5개. 오늘 하루와 오늘 일정을 응원하는 내용.',
     'cheers_pm: 오후·저녁(하원 뒤)에 들을 문장 5개. 오늘 하루를 돌아보며 칭찬하거나 어땠는지 묻고, 내일을 기대하게 하거나 푹 쉬라는 내용. "잘 다녀와"처럼 등원을 응원하는 표현은 쓰지 마세요.',
@@ -800,6 +804,8 @@ function buildDayBriefing_(targetDateStr, dayLabel, docText, calEventsForDay, ap
   const cheerRuleLines = [
     '   - [보호자 지침 — 다른 규칙보다 우선해서 따르세요] ' + (guideDoc.guide || '(없음)'),
     '   - [오늘 꼭 말할 것] ' + (guideDoc.must.length ? guideDoc.must.map((x, i) => (i + 1) + ') ' + x).join(' / ') : '(없음)'),
+    '   - [보호자가 좋다고 표시한 문장 — 이런 말투·길이·소재로 쓰되 같은 문장을 그대로 반복하지는 마세요] ' + (feedback.good.length ? feedback.good.join(' / ') : '(없음)'),
+    '   - [보호자가 어색하다고 표시한 문장 — 이런 표현·내용·구성은 피하세요. 이유가 있으면 이유를 따르세요] ' + (feedback.bad.length ? feedback.bad.join(' / ') : '(없음)'),
     '   - 한국어 문장은 "' + CHILD_NAME + '아,"로 시작하는 다정한 반말 한 문장, 40자 이내, 특수기호 없이.',
     '   - 각 묶음(아침·오후)마다 1개는 여섯 살 아이가 알아들을 아주 쉬운 영어 한 문장으로 쓰세요. 반드시 "Hey Daol,"로 시작하고 9단어 이내 (예: Hey Daol, have a wonderful day!). 이름을 문장 맨 앞이나 맨 끝에 두지 마세요(음성이 이름을 뭉개 읽습니다).',
     '   - 그날 일정(현장학습·숲체험·발표·나들이·여행 등)과 그날의 의미를 자연스럽게 반영하되, 일정이 없으면 평범한 하루를 응원하세요. 한 묶음이 모두 같은 일정만 말하지 않게 섞으세요.',
@@ -1165,49 +1171,111 @@ function splitNames_(v) {
   return String(v || '').split(/[,，;]+/).map(x => x.trim()).filter(Boolean);
 }
 
-const CHEER_LOG_DOC_NAME = '다올 격려 문장 로그';
-const PROP_CHEER_LOG_ID  = 'CHEER_LOG_DOC_ID';
-const PROP_CHEER_LAST    = 'CHEER_LOG_LAST';
+// 격려 문장 평가 시트: 문장 한 줄마다 좋음·나쁨 체크박스. 체크 결과를 다음 생성 프롬프트에 반영
+// (이전의 구글 문서 '다올 격려 문장 로그'는 더 쓰지 않음 — 문서는 지우지 않고 그대로 둠)
+const CHEER_SHEET_NAME    = '다올 격려 문장 평가';
+const PROP_CHEER_SHEET_ID = 'CHEER_SHEET_ID';
+const PROP_CHEER_LAST     = 'CHEER_LOG_LAST';
+const CHEER_SHEET_HEADER  = ['날짜', '시각', '묶음', '문장', '좋음', '나쁨', '메모', '모델', '참고 일정'];
+const CHEER_COL           = { date: 1, time: 2, kind: 3, text: 4, good: 5, bad: 6, memo: 7, model: 8, ctx: 9 };
+const CHEER_FEEDBACK_ROWS = 400;   // 평가를 읽을 최근 행 수
+const CHEER_FEEDBACK_MAX  = 8;     // 프롬프트에 넣을 좋음·나쁨 각각 최대 개수
 
 /**
- * 격려 문장 로그: 날짜·생성 시각·모델·참고한 일정·문장 목록을 구글 문서 맨 위에 추가
+ * 평가 시트 열기 (없으면 만들고 머리글·틀 고정·열 너비 설정)
+ */
+function getCheerSheet_(props) {
+  const p = props || PropertiesService.getScriptProperties();
+  let ss = null;
+  const id = p.getProperty(PROP_CHEER_SHEET_ID);
+  if (id) { try { ss = SpreadsheetApp.openById(id); } catch (e) { ss = null; } }
+  if (!ss) {
+    ss = SpreadsheetApp.create(CHEER_SHEET_NAME);
+    p.setProperty(PROP_CHEER_SHEET_ID, ss.getId());
+    const sh = ss.getSheets()[0];
+    sh.setName('평가');
+    sh.getRange(1, 1, 1, CHEER_SHEET_HEADER.length).setValues([CHEER_SHEET_HEADER]).setFontWeight('bold').setBackground('#f3f4f6');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(CHEER_COL.text, 360);
+    sh.setColumnWidth(CHEER_COL.memo, 200);
+    sh.setColumnWidth(CHEER_COL.ctx, 300);
+    [CHEER_COL.date, CHEER_COL.time, CHEER_COL.kind, CHEER_COL.good, CHEER_COL.bad].forEach(c => sh.setColumnWidth(c, c === CHEER_COL.date ? 110 : 56));
+    sh.getRange(1, CHEER_COL.ctx).setNote('좋음·나쁨을 클릭해 체크하세요. 이유는 메모 칸에 적으면 더 정확히 반영됩니다. 최신이 위.');
+  }
+  return ss.getSheets()[0];
+}
+
+/**
+ * 격려 문장 기록: 문장 한 줄마다 시트 맨 위(머리글 아래)에 추가하고 좋음·나쁨 체크박스를 넣음
  * - 같은 내용이 연속으로 생성되면 중복 기록하지 않음
- * - 문서에서 마음에 드는/어색한 문장을 보고 프롬프트(cheerRuleLines)나 HA 기본 문장을 고치는 용도
  */
 function logCheers_(props, todayBrief, generatedAt, model) {
   try {
     const am = (todayBrief && todayBrief.cheers) || [];
     const pm = (todayBrief && todayBrief.cheers_pm) || [];
     const must = (todayBrief && todayBrief.cheer_must) || [];
-    const cheers = must.map(x => '[꼭] ' + x).concat(am.map(x => '[아침] ' + x)).concat(pm.map(x => '[오후] ' + x));
+    const cheers = must.map(x => ['꼭', x]).concat(am.map(x => ['아침', x])).concat(pm.map(x => ['오후', x]));
     if (!cheers.length) return;
-    const sig = todayBrief.date + '|' + cheers.join('|');
+    const sig = todayBrief.date + '|' + cheers.map(c => c.join(':')).join('|');
     if (props.getProperty(PROP_CHEER_LAST) === sig.slice(0, 400)) return;
 
-    let doc = null;
-    const id = props.getProperty(PROP_CHEER_LOG_ID);
-    if (id) { try { doc = DocumentApp.openById(id); } catch (e) { doc = null; } }
-    if (!doc) {
-      doc = DocumentApp.create(CHEER_LOG_DOC_NAME);
-      props.setProperty(PROP_CHEER_LOG_ID, doc.getId());
-      doc.getBody().appendParagraph('마음에 드는 문장·어색한 문장을 표시해 두면 프롬프트 개선에 씁니다. (자동 기록, 최신이 위)');
-    }
-    const body = doc.getBody();
-    const ctx = (todayBrief.cheer_context || []).join(' / ') || '(일정 없음)';
-    const lines = [
-      ['H', formatDateWithDay_(todayBrief.date) + ' · ' + generatedAt.slice(11, 16) + ' · ' + model + ' · ' + todayBrief.source],
-      ['P', '참고 일정: ' + ctx + ((todayBrief.birthdays || []).length ? ' / 생일: ' + todayBrief.birthdays.join(', ') : '')]
-    ].concat((todayBrief.cheer_unsure || []).length ? [['P', '애매해서 쓰지 않은 일정: ' + todayBrief.cheer_unsure.join(' / ')]] : [])
-     .concat(cheers.map(c => ['P', '- ' + c])).concat([['P', '']]);
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const para = body.insertParagraph(0, lines[i][1]);
-      para.setHeading(lines[i][0] === 'H' ? DocumentApp.ParagraphHeading.HEADING3 : DocumentApp.ParagraphHeading.NORMAL);
-    }
-    doc.saveAndClose();
+    const sh = getCheerSheet_(props);
+    const ctxParts = (todayBrief.cheer_context || []).slice();
+    if ((todayBrief.birthdays || []).length) ctxParts.push('생일: ' + todayBrief.birthdays.join(', '));
+    if ((todayBrief.cheer_unsure || []).length) ctxParts.push('애매해서 안 씀: ' + todayBrief.cheer_unsure.join(', '));
+    const ctx = (ctxParts.join(' / ') || '(일정 없음)').slice(0, 1000);
+    const dateCell = formatDateWithDay_(todayBrief.date);
+    const timeCell = generatedAt.slice(11, 16);
+    const modelCell = model + ' · ' + todayBrief.source;
+
+    const rows = cheers.map((c, i) => [dateCell, timeCell, c[0], c[1], false, false, '', modelCell, i === 0 ? ctx : '']);
+    const n = rows.length;
+    sh.insertRowsBefore(2, n);
+    const rng = sh.getRange(2, 1, n, CHEER_SHEET_HEADER.length);
+    // 새 행이 위·아래 행 서식(머리글 굵기·체크박스 등)을 물려받지 않게 초기화
+    rng.clearFormat().clearDataValidations();
+    rng.setNumberFormat('@');   // 날짜·시각이 자동 변환되지 않게 글자로 저장
+    rng.setValues(rows);
+    sh.getRange(2, CHEER_COL.good, n, 2).setNumberFormat('General').insertCheckboxes();
+    sh.getRange(2, CHEER_COL.ctx, n, 1).setWrap(false);
+    // 같은 생성분 경계를 눈으로 구분 (첫 줄 위 굵은 선)
+    sh.getRange(2, 1, 1, CHEER_SHEET_HEADER.length).setBorder(true, null, null, null, null, null, '#9ca3af', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
     props.setProperty(PROP_CHEER_LAST, sig.slice(0, 400));
   } catch (e) {
-    console.warn('격려 문장 로그 기록 실패(무시): ' + e);
+    console.warn('격려 문장 기록 실패(무시): ' + e);
   }
+}
+
+/**
+ * 보호자 평가 읽기: 최근 행에서 좋음·나쁨 체크한 문장(최신순, 각 최대 8개). 둘 다 체크한 줄은 무시
+ * - 시트가 아직 없으면 만들지 않고 빈 결과
+ */
+function getCheerFeedback_(props) {
+  const out = { good: [], bad: [] };
+  try {
+    const p = props || PropertiesService.getScriptProperties();
+    const id = p.getProperty(PROP_CHEER_SHEET_ID);
+    if (!id) return out;
+    const sh = SpreadsheetApp.openById(id).getSheets()[0];
+    const last = sh.getLastRow();
+    if (last < 2) return out;
+    const n = Math.min(last - 1, CHEER_FEEDBACK_ROWS);
+    const seen = {};
+    sh.getRange(2, 1, n, CHEER_COL.memo).getValues().forEach(r => {
+      const text = String(r[CHEER_COL.text - 1] || '').trim();
+      const good = r[CHEER_COL.good - 1] === true;
+      const bad = r[CHEER_COL.bad - 1] === true;
+      if (!text || good === bad || seen[text]) return;
+      seen[text] = true;
+      const memo = String(r[CHEER_COL.memo - 1] || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      const line = '"' + text.slice(0, 70) + '"' + (memo ? ' (이유: ' + memo + ')' : '');
+      const arr = good ? out.good : out.bad;
+      if (arr.length < CHEER_FEEDBACK_MAX) arr.push(line);
+    });
+  } catch (e) {
+    console.warn('격려 문장 평가 읽기 실패(무시): ' + e);
+  }
+  return out;
 }
 
 const CHEER_GUIDE_DOC_NAME = '다올 격려 문장 지침';
@@ -1455,7 +1523,8 @@ function collectDocLinks_() {
   const url = id => id ? ('https://docs.google.com/document/d/' + id + '/edit') : '';
   return {
     guide: url(props.getProperty(PROP_CHEER_GUIDE_ID)),    // 다올 격려 문장 지침 (지침·꼭 말할 것 적는 곳)
-    log: url(props.getProperty(PROP_CHEER_LOG_ID)),        // 다올 격려 문장 로그
+    // log: 다올 격려 문장 평가 시트 (HA 대시보드 링크 키는 그대로 'log')
+    log: props.getProperty(PROP_CHEER_SHEET_ID) ? ('https://docs.google.com/spreadsheets/d/' + props.getProperty(PROP_CHEER_SHEET_ID) + '/edit') : '',
     summary: url(props.getProperty(PROP_DOC_ID))           // 통신문 요약
   };
 }
@@ -1495,7 +1564,7 @@ function sendBriefingEmail_(props, briefing, opts) {
   // 놓친 메일 확인용: 처리 실패(재시도 중) + 최근 24시간 '관련없음' 판정
   const issues = getParseIssues_(props);
   const docLinks = collectDocLinks_();
-  const linkHtml = [['격려 문장 지침(지침·꼭 말할 것 적기)', docLinks.guide], ['격려 문장 로그', docLinks.log], ['통신문 요약', docLinks.summary]]
+  const linkHtml = [['격려 문장 지침(지침·꼭 말할 것 적기)', docLinks.guide], ['격려 문장 평가(좋음·나쁨 체크)', docLinks.log], ['통신문 요약', docLinks.summary]]
     .filter(x => x[1]).map(x => '<a href="' + x[1] + '">' + escapeHtml_(x[0]) + '</a>').join(' · ');
   const issuePlain = [];
   const actLines = recentActivityLines_(briefing.today.date, ACTIVITY_CHEER_DAYS);
@@ -1515,7 +1584,7 @@ function sendBriefingEmail_(props, briefing, opts) {
     formatDayPlain_('내일', briefing.tomorrow),
     issuePlain.length ? ('\n' + issuePlain.join('\n\n')) : '',
     '',
-    '문서: 격려 문장 지침 ' + docLinks.guide + ' / 격려 문장 로그 ' + docLinks.log + ' / 통신문 요약 ' + docLinks.summary
+    '문서: 격려 문장 지침 ' + docLinks.guide + ' / 격려 문장 평가 ' + docLinks.log + ' / 통신문 요약 ' + docLinks.summary
   ].join('\n');
 
   const htmlBody = [
